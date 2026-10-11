@@ -1,11 +1,10 @@
 [project]
-name = "yuketangautoplayer"
+name = "changjiang-yuketang"
 version = "1.0.0"
-description = "雨课堂视频自动播放器 - 基于Selenium的MOOC课程自动刷课工具"
+description = "长江雨课堂视频自动播放器 - 基于 Selenium 的无头刷课工具"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "pyinstaller>=6.16.0",
     "selenium>=4.0.0",
 ]
 

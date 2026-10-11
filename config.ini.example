@@ -1,11 +1,11 @@
-; YuketangAutoPlayer 配置文件
-; headless: 是否无窗口运行 (true/false)，首次使用建议false
+; 长江雨课堂 配置文件
+; headless: 是否无窗口运行 (true/false)，挂后台建议 true
 ; browser: chrome / edge / auto，auto 表示自动探测本机已安装的浏览器
 ; ui: auto / common / legacy，雨课堂前端版本；auto 表示按域名判断，未知域名则运行时自动探测
-;     www.yuketang.cn、changjiang.yuketang.cn（长江雨课堂）为新版(common)
+;     changjiang.yuketang.cn（长江雨课堂）、www.yuketang.cn 为新版(common)
 ; course_url: 你的课程地址，必须包含 https:// 协议头
-;             例如: https://www.yuketang.cn/v2/web/studentLog/12345678
-; cookie: 你的sessionid值，获取方式见README.md
+;             例如: https://changjiang.yuketang.cn/v2/web/studentLog/12345678
+; cookie: 你的sessionid值，建议用 refresh_cookie.bat 自动获取
 ; speed: 播放倍速，1 = 原速，2 = 两倍速（允许 0.5 ~ 4）
 ; implicitly_wait: 元素查找超时时间(秒)，一般不需要修改
 

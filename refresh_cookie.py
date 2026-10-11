@@ -1,6 +1,7 @@
 '''
-Author: Vane（本机适配）
-Description: 刷新 config.ini 里的 sessionid，两条路径：
+长江雨课堂 - cookie 刷新脚本
+
+刷新 config.ini 里的 sessionid，两条路径：
              1) 优先直接读本机 Firefox 的 cookie 库（Firefox 的 cookie 是明文存储，
                 只要 Firefox 里还登录着雨课堂就能秒取，不用扫码）
              2) Firefox 里没有有效登录时，回退到打开浏览器扫码登录

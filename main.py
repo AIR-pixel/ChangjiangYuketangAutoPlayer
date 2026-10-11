@@ -1,9 +1,11 @@
 '''
-Author: LetMeFly, Guo-Chenxu, Crsuh2er0, 420xincheng, tkzzzzzz6
-Date: 2023-09-12 20:49:21
-LastEditors: LetMeFly.xyz
-LastEditTime: 2025-11-13 22:44:00
-Description: 开源于https://github.com/LetMeFly666/YuketangAutoPlayer 欢迎issue、PR
+长江雨课堂 - 视频自动播放器
+
+长江雨课堂（changjiang.yuketang.cn）专用：无头后台运行、自动切换下一集、真实 2 倍速。
+
+基础代码来自 https://github.com/LetMeFly666/YuketangAutoPlayer
+上游作者：LetMeFly, Guo-Chenxu, Crsuh2er0, 420xincheng, tkzzzzzz6
+本项目按 LGPL-2.1 授权（见 LICENSE）。实现细节与实测记录见 docs/技术细节.md
 '''
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -33,14 +35,14 @@ def create_config_template(config_path):
 
     try:
         with open(config_path, 'w', encoding='utf-8') as f:
-            f.write('; YuketangAutoPlayer 配置文件\n')
-            f.write('; headless: 是否无窗口运行 (true/false)，首次使用建议false\n')
+            f.write('; 长江雨课堂 配置文件\n')
+            f.write('; headless: 是否无窗口运行 (true/false)，挂后台建议 true\n')
             f.write('; browser: chrome / edge / auto，auto 表示自动探测本机已安装的浏览器\n')
             f.write('; ui: auto / common / legacy，雨课堂前端版本；auto 表示按域名判断，未知域名则运行时自动探测\n')
-            f.write(';     www.yuketang.cn、changjiang.yuketang.cn（长江雨课堂）为新版(common)\n')
+            f.write(';     changjiang.yuketang.cn（长江雨课堂）、www.yuketang.cn 为新版(common)\n')
             f.write('; course_url: 你的课程地址，必须包含 https:// 协议头\n')
-            f.write(';             例如: https://www.yuketang.cn/v2/web/studentLog/12345678\n')
-            f.write('; cookie: 你的sessionid值，获取方式见README.md\n')
+            f.write(';             例如: https://changjiang.yuketang.cn/v2/web/studentLog/12345678\n')
+            f.write('; cookie: 你的sessionid值，建议用 refresh_cookie.bat 自动获取\n')
             f.write('; speed: 播放倍速，1 = 原速，2 = 两倍速（允许 0.5 ~ 4）\n')
             f.write('; implicitly_wait: 元素查找超时时间(秒)，一般不需要修改\n\n')
             config.write(f)
@@ -79,7 +81,7 @@ def load_config():
 
 # 加载配置
 print('='*50)
-print('YuketangAutoPlayer - 雨课堂视频自动播放器')
+print('长江雨课堂 - 视频自动播放器')
 print('='*50)
 
 config = load_config()
