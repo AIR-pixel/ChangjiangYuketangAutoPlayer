@@ -257,10 +257,18 @@ SKIPPED_STALLED = []   # 因卡住被跳过的标题，收尾时如实汇报
 
 
 def video_title(unit: WebElement) -> str:
+    """取小节标题。返回空串时必须被上层当成"页面还没渲染完"，不能当成合法标题。
+
+    反例（2026-10-11 实跑踩到）：把空串写进 PLAYED_TITLES 之后，所有同样取不到标题的
+    小节都会被 need_play 判成"已播过"，任务被误判成"全部播放完毕"——明明还剩几十个没刷。
+    所以这里区分两种"取不到"：name-text 元素根本不存在（旧版 UI）走整块文本兜底；
+    name-text 存在但内容为空，说明列表渲染到一半，返回空串让上层重来。
+    """
     try:
-        return unit.find_element(By.CSS_SELECTOR, 'span.name-text').text.strip()
+        el = unit.find_element(By.CSS_SELECTOR, 'span.name-text')
     except Exception:
         return ' '.join(unit.text.split())[:60]
+    return el.text.strip()
 
 
 def need_play(unit: WebElement):
@@ -451,6 +459,58 @@ def js_click(element):
     driver.execute_script('arguments[0].click()', element)
 
 
+# 点标题前注入：把站点的 window.open 收编，并改写 target=_blank。
+#
+# 为什么非要这么做（2026-10-11 实跑踩到）：原先是"让它开新标签页 → 播完再 close"，
+# 结果 driver.close() 在这站偶发卡死 20 秒（failed to close window in 20 seconds），
+# 窗口管理当场错乱，后面连着几轮全废。
+# 实测该站就是调 window.open(url, '_blank') 打开视频页的，把这个 URL 截下来以后
+# 在当前标签页直接 driver.get(url) 一样能出可播的视频页 —— 全程只有一个窗口，
+# 不需要 close，也就没有卡死的可能。
+# window.open 必须返回一个假窗口对象：站点拿到返回值会调 focus()/close()，
+# 直接返回 null 会让它内部抛错，可能连 URL 都不给。
+CAPTURE_VIDEO_URL_JS = '''
+(function () {
+    if (!window.__ytOpenPatched) {
+        window.__ytOpenPatched = true;
+        window.__ytVideoUrl = null;
+        window.__ytOpenCalls = 0;
+        window.open = function (u, n, f) {
+            window.__ytOpenCalls++;
+            if (typeof u === 'string' && u) { window.__ytVideoUrl = u; }
+            return { closed: false, focus: function () {}, blur: function () {},
+                     close: function () {}, document: { write: function () {} },
+                     location: { href: u } };
+        };
+    }
+    window.__ytVideoUrl = null;
+    var n = 0;
+    document.querySelectorAll('a[target="_blank"]').forEach(function (a) {
+        a.setAttribute('target', '_self');
+        n++;
+    });
+    return n;
+})();
+'''
+
+
+def _units_rendered(units) -> bool:
+    """小节列表是否渲染出了标题。
+
+    实测（2026-10-11 实跑）：课程页偶尔会先吐出 80 多个空的 study-unit 骨架、
+    标题稍后才填上。此时若直接往下走，取到的是空标题，会把整轮任务带偏
+    （见 video_title 的说明）。宁可重载一次课程页，也别拿半成品往下跑。
+    """
+    driver.implicitly_wait(0.1)
+    try:
+        for u in units[:5]:
+            if video_title(u):
+                return True
+        return False
+    finally:
+        driver.implicitly_wait(IMPLICITLY_WAIT)
+
+
 def load_classes() -> List[WebElement]:
     """返回课程页所有小节元素，首次调用时会确定 UI 版本。
 
@@ -475,13 +535,21 @@ def load_classes() -> List[WebElement]:
         IS_COMMONUI = probed
         print(f'UI 版本自动判定: {"新版(common)" if probed else "旧版(legacy)"}')
         if probed:
-            return driver.find_elements(By.CLASS_NAME, 'study-unit')
+            return load_classes()
         return driver.find_elements(By.CLASS_NAME, 'leaf-detail')
 
     if IS_COMMONUI:
-        click_report_tab()
-        sleep(2)  # 小节列表是点完标签后异步渲染的，给渲染留点时间
-        return driver.find_elements(By.CLASS_NAME, 'study-unit')
+        units = []
+        for attempt in (1, 2, 3):
+            click_report_tab()
+            sleep(2)  # 小节列表是点完标签后异步渲染的，给渲染留点时间
+            units = driver.find_elements(By.CLASS_NAME, 'study-unit')
+            if not units or _units_rendered(units):
+                return units
+            print(f'提示: 小节列表出来了但标题还是空的（第 {attempt} 次），重新加载课程页')
+            driver.get(COURSE_URL)
+            sleep(4)
+        return units
     return driver.find_elements(By.CLASS_NAME, 'leaf-detail')
 
 
@@ -490,19 +558,45 @@ ABORTED_ERRORS = False      # 连续出错而中止
 
 
 def back_to_course_page():
-    """关掉多余窗口并重新打开课程页。
+    """确保回到课程页，并且不留下多余窗口。
 
-    不能只 driver.refresh()：视频页若是同页跳转（不是新标签页），刷新到的会是视频页，
-    下一轮就在错误的页面上找小节了。这里统一重定向回课程页，两种情况都稳。
+    正常情况下现在只有 1 个窗口（点标题不再开新标签页，见 CAPTURE_VIDEO_URL_JS），
+    这里主要是兜底：万一哪一轮 window.open 拦截没生效、真开了新标签页，
+    必须把它清掉，否则下一轮点击又会多开一个，窗口越堆越多。
+
+    但 close 本身在这站有概率卡住 20 秒（2026-10-11 实跑：
+    "failed to close window in 20 seconds"），所以：
+      - 循环有上限，绝不无限重试；
+      - close 失败就把那个窗口导航到 about:blank，至少别让它停在视频页继续占资源；
+      - 无论如何最后都重定向回课程页。
     """
-    try:
-        while len(driver.window_handles) > 1:
-            driver.switch_to.window(driver.window_handles[-1])
+    for _ in range(3):
+        handles = driver.window_handles
+        if len(handles) <= 1:
+            break
+        try:
+            driver.switch_to.window(handles[-1])
+            driver.execute_script('window.onbeforeunload = null;')
+        except Exception:
+            pass
+        try:
             driver.close()
+        except Exception as e:
+            first_line = str(e).splitlines()[0][:130] if str(e) else ''
+            print(f'  关闭多余窗口失败（继续）: {type(e).__name__}: {first_line}')
+            try:
+                driver.get('about:blank')
+            except Exception:
+                pass
+            break
+
+    try:
         driver.switch_to.window(driver.window_handles[0])
     except Exception as e:
-        print(f'  整理窗口时出错（继续）: {type(e).__name__}: {e}')
+        print(f'  切换回主窗口时出错（继续）: {type(e).__name__}: {e}')
     driver.get(COURSE_URL)
+    if len(driver.window_handles) > 1:
+        print(f'  注意: 当前仍有 {len(driver.window_handles)} 个窗口，下一轮可能会受影响')
 
 
 def dump_dom():
@@ -541,11 +635,20 @@ def finish1video():
         return False
     video = allVideos[0]
     title = video_title(video)
+    if not title:
+        # 关键防线：空标题绝不能进 PLAYED_TITLES。否则这一轮的"页面没渲染完"
+        # 会被永久记成"这些小节都播过了"，下一轮直接报"全部播放完毕"收工。
+        print('警告: 选中的小节连标题都取不到，课程页很可能没渲染完，本轮放弃重来')
+        return None
     PLAYED_TITLES.add(title)
     print(f'目标: {title}')
     driver.execute_script('arguments[0].scrollIntoView(false);', video)
-    # 先记下当前窗口集合：雨课堂有的入口是新开标签页，有的就是当前页跳转。
-    # 若是同页跳转却照原样 driver.close()，会把整个浏览器关掉，任务当场结束。
+    # 先收编 window.open，再点标题 —— 这样它不会开新标签页，只把视频 URL 交出来。
+    try:
+        retargeted = driver.execute_script(CAPTURE_VIDEO_URL_JS)
+    except Exception as e:
+        retargeted = 0
+        print(f'  提示: 注入 window.open 拦截失败（走兜底路径）: {type(e).__name__}')
     before_handles = driver.window_handles[:]
     if IS_COMMONUI:
         # 新版：点标题文字打开视频页。实测长江雨课堂里该元素的第一个 span 是类型标签
@@ -561,34 +664,75 @@ def finish1video():
     else:
         video.click()
     sleep(2)
+
     new_handles = [h for h in driver.window_handles if h not in before_handles]
-    opened_new_window = bool(new_handles)
-    if opened_new_window:
+    try:
+        video_url = driver.execute_script('return window.__ytVideoUrl;')
+    except Exception:
+        video_url = None
+
+    if new_handles:
+        # 兜底路径：拦截没生效，站点还是开了新标签页
         driver.switch_to.window(new_handles[-1])
-    print(f'正在播放（{"新标签页" if opened_new_window else "当前页跳转"}）')
-    WebDriverWait(driver, 10).until(lambda x: driver.execute_script('video = document.querySelector("video"); console.log(video); return video;'))  # 这里即使2次sleep3s选中的video还是null
+        opened_new_window = True
+        print(f'正在播放（新标签页 —— window.open 拦截没生效，已改写 {retargeted} 个 target）')
+    else:
+        opened_new_window = False
+        if video_url:
+            # 拦截生效：URL 拿到了，但当前页没动，需要自己跳过去
+            driver.get(video_url)
+            print('正在播放（当前标签页直达视频页）')
+        else:
+            print('正在播放（站点自己完成了当前页跳转）')
+
+    def leave_video_window():
+        """离开视频页。先把注入拆干净，再处理窗口。
+
+        不管后面走哪个分支，第一步都必须是"停掉自己注入的定时器和监听、置 __ytDone"，
+        否则页面卸载时会和播放器打架，close 直接卡死 20 秒
+        （2026-10-11 实跑：failed to close window in 20 seconds）。
+        """
+        try:
+            driver.execute_script(
+                'window.__ytDone = true;'
+                'try { clearInterval(window.__ytTimer); } catch (e) {}'
+                'try { clearInterval(videoPlay); } catch (e) {}'
+                'try { window.onbeforeunload = null; } catch (e) {}'
+            )
+        except Exception:
+            pass
+        if opened_new_window:
+            try:
+                driver.close()
+                driver.switch_to.window(driver.window_handles[-1])
+            except Exception as e:
+                first_line = str(e).splitlines()[0][:130] if str(e) else ''
+                print(f'  关闭视频窗口时出错（继续）: {type(e).__name__}: {first_line}')
+
+    try:
+        WebDriverWait(driver, 10).until(lambda x: driver.execute_script('video = document.querySelector("video"); console.log(video); return video;'))  # 这里即使2次sleep3s选中的video还是null
+    except Exception:
+        # 视频页没起来（实测会发生在上一轮窗口状态已经乱了的时候）。
+        # 明确报"本轮没进展"，并把注入拆干净再退出，别把异常丢给主循环。
+        print('警告: 视频页 10 秒内没有出现 video 元素，本轮放弃')
+        leave_video_window()
+        return None
+
     driver.execute_script('videoPlay = setInterval(function() {var v = document.querySelector("video"); if (v && v.paused) {v.play();}}, 200);')
     driver.execute_script('setTimeout(() => clearInterval(videoPlay), 5000)')
     driver.execute_script('addFinishMark = function() {finished = document.createElement("span"); finished.setAttribute("id", "LetMeFly_Finished"); document.body.appendChild(finished); console.log("Finished");}')
     driver.execute_script('lastDuration = 0; setInterval(() => {var v = document.querySelector("video"); if (!v) {return;} nowDuration = v.currentTime; if (nowDuration < lastDuration) {addFinishMark()}; lastDuration = nowDuration}, 200)')
     # 播放器带防刷逻辑（页面失焦/不可见就 pause），这里挂到 document 捕获阶段而不是
     # 全局 video 变量上：pause 不冒泡，但捕获阶段能收到；换掉 <video> 也不会失效。
+    # __ytDone 一旦置位就放手 —— 否则离开页面时这个"续播"监听会和卸载流程互相顶。
     driver.execute_script(
         'document.addEventListener("pause", function (e) {'
-        '  try { if (e.target && e.target.tagName === "VIDEO") { e.target.play(); } } catch (err) {}'
+        '  try { if (!window.__ytDone && e.target && e.target.tagName === "VIDEO") { e.target.play(); } }'
+        '  catch (err) {}'
         '}, true)'
     )
     mute1video()
     change2speed2()
-
-    def leave_video_window():
-        """回到课程页那个窗口（同页跳转时没有额外窗口，什么都不用做）"""
-        if opened_new_window:
-            try:
-                driver.close()
-                driver.switch_to.window(driver.window_handles[-1])
-            except Exception as e:
-                print(f'  关闭视频窗口时出错（继续）: {type(e).__name__}: {e}')
 
     last_pos = -1.0
     last_t = None
@@ -643,7 +787,9 @@ def finish1video():
 
 
 consecutive_errors = 0
+no_progress_rounds = 0
 total_played = 0
+ABORTED_NO_PROGRESS = False   # 连续几轮一个视频都没真正开起来
 while True:
     try:
         played = finish1video()
@@ -665,6 +811,24 @@ while True:
         sleep(5)
         continue
 
+    # finish1video 返回 None = 本轮没真正开起来任何视频（页面没渲染完、视频页没起来等）。
+    # 这种情况绝不能当成"没有未完成视频了"直接收工 —— 2026-10-11 实跑就是这么
+    # 误报"全部播放完毕"的，其实还剩几十个没刷。
+    if played is None:
+        no_progress_rounds += 1
+        print(f'本轮没有任何进展（连续第 {no_progress_rounds} 次），回课程页重来')
+        if no_progress_rounds >= 3:
+            ABORTED_NO_PROGRESS = True
+            print('连续 3 轮没有任何进展，停止。这不是"刷完了"，请检查上面的警告。')
+            break
+        try:
+            back_to_course_page()
+        except Exception:
+            pass
+        sleep(5)
+        continue
+
+    no_progress_rounds = 0
     if not played:
         break
     total_played += 1
@@ -677,6 +841,9 @@ if ABORTED_NO_CLASSES:
     print('已中止: 未找到任何小节元素，视频没有被播放，请查看上面的警告信息')
 elif ABORTED_ERRORS:
     print('已中止: 连续出错，任务没有跑完。重跑会接着刷没完成的。')
+elif ABORTED_NO_PROGRESS:
+    print(f'已中止: 连续 3 轮没能开始播放任何视频（本次共播出 {total_played} 个）。')
+    print('  这不代表刷完了。常见原因是课程页没渲染完或窗口状态异常，重跑一般能接着刷。')
 else:
     print(f'恭喜你！全部播放完毕（本次共播出 {total_played} 个视频）')
     if SKIPPED_STALLED:

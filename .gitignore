@@ -165,3 +165,6 @@ chromedriver.exe
 
 # 运行时产物：一个小节都找不到时 dump_dom() 落盘的现场页面
 _debug_page_source.html
+
+# 本地发布工具（含账号与仓库配置，不属于仓库内容）
+.gh_publish.py
