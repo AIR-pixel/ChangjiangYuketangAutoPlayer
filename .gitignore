@@ -162,3 +162,6 @@ cython_debug/
 # 项目特定配置
 config.ini
 chromedriver.exe
+
+# 运行时产物：一个小节都找不到时 dump_dom() 落盘的现场页面
+_debug_page_source.html
