@@ -12,12 +12,17 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.remote.webelement import WebElement
 from typing import List
-from time import sleep, monotonic
+from time import sleep, monotonic, strftime
 import random
 import os
 import re
 import sys
 import configparser
+
+
+def ts() -> str:
+    """日志时间戳。挂后台无人看守时，出事的时间点就是唯一的线索。"""
+    return strftime('%H:%M:%S')
 
 
 def create_config_template(config_path):
@@ -148,6 +153,21 @@ def create_driver():
         '--autoplay-policy=no-user-gesture-required',
         '--disable-blink-features=AutomationControlled',
         '--window-size=1920,1080',
+        # ---- 压制渲染进程崩溃（2026-10-11 实测，详见 docs/技术细节.md）----
+        # 该站视频播到几分钟后，Edge 的渲染进程会以固定的
+        #   msedge.dll +0x556c74d  ACCESS_VIOLATION（0xC0000005）
+        # 崩掉（崩溃转储里 17/17 个地址完全一致）。崩溃进程加载着整套硬件解码链
+        # （mfx_mft_vp9ve_64 / mfx_mft_h264ve_64 / igd11dxva64 / nvEncMFTH264x ...）。
+        # 强制走软件解码并把 GPU 相关路径关掉，实测存活时间从 ~75s 拉到 ~296s。
+        # 没能根除，所以循环里还配了"崩了就重建浏览器"的兜底。
+        '--disable-accelerated-video-decode',
+        '--disable-accelerated-video-encode',
+        '--disable-gpu',
+        '--disable-gpu-compositing',
+        '--disable-software-rasterizer',
+        '--disable-dev-shm-usage',
+        # 无头下没有窗口可遮挡，这个检测只会误伤（还会触发站点的防刷暂停）
+        '--disable-features=CalculateNativeWinOcclusion',
     ]
     if IF_HEADLESS:
         # 后台跑：不给窗口，也不出声
@@ -319,12 +339,21 @@ def at_login_page():
     return logged_out
 
 
-# homePageURL 与 IS_COMMONUI 已在读取配置后确定
-driver.get(homePageURL)
-setCookie({'sessionid': COOKIE})
-driver.get(COURSE_URL)
-sleep(3)
-if at_login_page():
+def goto_course_page(allow_qr=True) -> bool:
+    """（重新）进入课程页：先落到首页把 cookie 塞进去，再打开课程页。
+
+    启动时和「浏览器崩了重建之后」都走这里，保证两条路径行为一致。
+    重建时传 allow_qr=False —— 那时候不该停下来等人扫码。
+    """
+    driver.get(homePageURL)
+    setCookie({'sessionid': COOKIE})
+    driver.get(COURSE_URL)
+    sleep(3)
+    if not at_login_page():
+        return True
+    if not allow_qr:
+        print('  重建后仍停在登录页 —— cookie 可能已失效，请重跑 refresh_cookie.bat')
+        return False
     print('cookie失效或设置有误，请重设cookie或选择每次扫码登录')
     driver.get(homePageURL)
     driver.find_element(By.CLASS_NAME, 'login-btn').click()
@@ -333,6 +362,65 @@ if at_login_page():
         sleep(0.5)
     print('登录成功')
     driver.get(COURSE_URL)
+    return True
+
+
+# "浏览器/标签页已经死了"的报错特征。
+#
+# 这站视频播几分钟后，Edge 的渲染进程会崩（实测崩点固定为
+# msedge.dll +0x556c74d 的 ACCESS_VIOLATION）。无头模式只有一个标签页，
+# 标签页一崩整个 Edge 进程跟着退出，下一轮再访问就变成 InvalidSessionIdException。
+# 这类异常**重试同一个 driver 永远不可能成功**，只能重建浏览器。
+DEAD_SESSION_MARKS = (
+    'invalid session id', 'tab crashed', 'not connected to devtools',
+    'browser has closed the connection', 'session deleted', 'disconnected',
+    'chrome not reachable', 'target closed', 'no such window',
+)
+
+
+def is_browser_gone(exc: BaseException) -> bool:
+    text = f'{type(exc).__name__}: {exc}'.lower()
+    return any(mark in text for mark in DEAD_SESSION_MARKS)
+
+
+def session_alive() -> bool:
+    """轻量探活，不抛异常。"""
+    try:
+        driver.window_handles
+        return True
+    except Exception:
+        return False
+
+
+def restart_browser() -> bool:
+    """丢掉死掉的会话，重建浏览器并回到课程页。
+
+    视频进度记在服务端，重开会从断点续播，所以重建几乎不丢东西。
+    """
+    global driver
+    print(f'{ts()} 浏览器已退出（标签页崩溃会带走整个进程），正在重建…')
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    sleep(3)
+    try:
+        driver = create_driver()
+        if not IF_HEADLESS:
+            driver.maximize_window()
+        driver.implicitly_wait(IMPLICITLY_WAIT)
+    except Exception as e:
+        print(f'  重建浏览器失败: {type(e).__name__}: {str(e).splitlines()[0][:120]}')
+        return False
+    try:
+        return goto_course_page(allow_qr=False)
+    except Exception as e:
+        print(f'  重建后回课程页失败: {type(e).__name__}: {str(e).splitlines()[0][:120]}')
+        return False
+
+
+# homePageURL 与 IS_COMMONUI 已在读取配置后确定
+goto_course_page()
 
 
 GET_VIDEO_JS = (
@@ -581,6 +669,11 @@ def back_to_course_page():
             driver.execute_script('window.onbeforeunload = null;')
         except Exception:
             pass
+        # 关窗前**重新数一遍**。上面那份 handles 是快照，这一瞬站点可能已经自己
+        # 把那个标签页关掉了；此时再 close() 关掉的就是主窗口 —— 整个浏览器直接退出，
+        # 下一轮就报 InvalidSessionIdException。（2026-10-11 实跑踩到过这个现象）
+        if len(driver.window_handles) <= 1:
+            break
         try:
             driver.close()
         except Exception as e:
@@ -624,14 +717,14 @@ def finish1video():
         # 必须显式告警：否则会一路 return False，主循环结束并打印"全部播放完毕"，
         # 看起来像刷成功了，其实一个视频都没播。
         ABORTED_NO_CLASSES = True
-        print('警告: 页面上没有找到任何小节元素，本次不会播放任何视频')
+        print(f'{ts()} 警告: 页面上没有找到任何小节元素，本次不会播放任何视频')
         print(f'  当前 UI 判定: {"新版(common)" if IS_COMMONUI else "旧版(legacy)"}')
         print(f'  当前 URL: {driver.current_url}')
         print(f'  页面标题: {driver.title}')
         print('  常见原因: 课程页没加载完 / 未登录成功 / 该站点 UI 结构与已知两套都不同')
         dump_dom()
         return False
-    print('正在寻找未完成的视频，请耐心等待')
+    print(f'{ts()} 正在寻找未完成的视频，请耐心等待')
     allVideos = getAllvideos_notFinished(allClasses)
     if not allVideos:
         return False
@@ -640,10 +733,10 @@ def finish1video():
     if not title:
         # 关键防线：空标题绝不能进 PLAYED_TITLES。否则这一轮的"页面没渲染完"
         # 会被永久记成"这些小节都播过了"，下一轮直接报"全部播放完毕"收工。
-        print('警告: 选中的小节连标题都取不到，课程页很可能没渲染完，本轮放弃重来')
+        print(f'{ts()} 警告: 选中的小节连标题都取不到，课程页很可能没渲染完，本轮放弃重来')
         return None
     PLAYED_TITLES.add(title)
-    print(f'目标: {title}')
+    print(f'{ts()} 目标: {title}')
     driver.execute_script('arguments[0].scrollIntoView(false);', video)
     # 先收编 window.open，再点标题 —— 这样它不会开新标签页，只把视频 URL 交出来。
     try:
@@ -677,15 +770,15 @@ def finish1video():
         # 兜底路径：拦截没生效，站点还是开了新标签页
         driver.switch_to.window(new_handles[-1])
         opened_new_window = True
-        print(f'正在播放（新标签页 —— window.open 拦截没生效，已改写 {retargeted} 个 target）')
+        print(f'{ts()} 正在播放（新标签页 —— window.open 拦截没生效，已改写 {retargeted} 个 target）')
     else:
         opened_new_window = False
         if video_url:
             # 拦截生效：URL 拿到了，但当前页没动，需要自己跳过去
             driver.get(video_url)
-            print('正在播放（当前标签页直达视频页）')
+            print(f'{ts()} 正在播放（当前标签页直达视频页）')
         else:
-            print('正在播放（站点自己完成了当前页跳转）')
+            print(f'{ts()} 正在播放（站点自己完成了当前页跳转）')
 
     def leave_video_window():
         """离开视频页。先把注入拆干净，再处理窗口。
@@ -705,7 +798,10 @@ def finish1video():
             pass
         if opened_new_window:
             try:
-                driver.close()
+                # 同样要先重新数：站点可能已经自己把视频标签页关掉了，
+                # 这时 close() 会误关主窗口，把整个浏览器带走。
+                if len(driver.window_handles) > 1:
+                    driver.close()
                 driver.switch_to.window(driver.window_handles[-1])
             except Exception as e:
                 first_line = str(e).splitlines()[0][:130] if str(e) else ''
@@ -716,7 +812,7 @@ def finish1video():
     except Exception:
         # 视频页没起来（实测会发生在上一轮窗口状态已经乱了的时候）。
         # 明确报"本轮没进展"，并把注入拆干净再退出，别把异常丢给主循环。
-        print('警告: 视频页 10 秒内没有出现 video 元素，本轮放弃')
+        print(f'{ts()} 警告: 视频页 10 秒内没有出现 video 元素，本轮放弃')
         leave_video_window()
         return None
 
@@ -743,7 +839,7 @@ def finish1video():
     while True:
         # 判据一：原实现的"时间回退"标记（播放器自动循环时会命中）
         if driver.execute_script('return document.querySelector("#LetMeFly_Finished");'):
-            print('检测到播放结束标记，再等 5 秒')
+            print(f'{ts()} 检测到播放结束标记，再等 5 秒')
             sleep(5)
             leave_video_window()
             return True
@@ -760,7 +856,7 @@ def finish1video():
         if info:
             pos, dur, ended = info
             if ended or (dur and pos >= dur - 0.5):
-                print(f'播放已到结尾（{pos:.1f}s / {dur:.1f}s）')
+                print(f'{ts()} 播放已到结尾（{pos:.1f}s / {dur:.1f}s）')
                 sleep(3)
                 leave_video_window()
                 return True
@@ -774,13 +870,13 @@ def finish1video():
                 stalled = 0
             last_pos = pos
             speed_txt = f' | 实测倍速 {measured:.2f}x' if measured else ''
-            print(f'正在播放视频 | 已播 {pos:.0f}s / 共 {dur:.0f}s{speed_txt}')
+            print(f'{ts()} 正在播放视频 | 已播 {pos:.0f}s / 共 {dur:.0f}s{speed_txt}')
         else:
             stalled += 1
 
         # 判据三：兜底。真卡死了也要能跳到下一集，别把整晚耗在同一个视频上
         if stalled >= 100:  # 约 5 分钟没有任何前进
-            print('警告: 视频 5 分钟没有前进，放弃这一集，跳到下一个')
+            print(f'{ts()} 警告: 视频 5 分钟没有前进，放弃这一集，跳到下一个')
             SKIPPED_STALLED.append(title)
             leave_video_window()
             return True
@@ -791,15 +887,41 @@ def finish1video():
 consecutive_errors = 0
 no_progress_rounds = 0
 total_played = 0
+browser_deaths = 0            # 连续几次"浏览器崩了"，跑通一轮就清零
+force_restart = False         # 刚抓到浏览器崩溃，下一轮开头强制重建
 ABORTED_NO_PROGRESS = False   # 连续几轮一个视频都没真正开起来
+ABORTED_BROWSER = False       # 浏览器反复崩溃、重建也起不来
 while True:
+    # 浏览器/标签页崩了就重建。
+    # tab 崩溃会带走整个 Edge 进程（无头下只有一个标签页），而这类异常**重试同一个
+    # driver 永远不可能成功** —— 以前就是这里白烧 3 轮重试、然后整个任务终止。
+    # 视频进度记在服务端，重建后从断点续播，几乎不丢东西。
+    if force_restart or not session_alive():
+        force_restart = False
+        browser_deaths += 1
+        if browser_deaths > 6:
+            ABORTED_BROWSER = True
+            print(f'{ts()} 浏览器已经连续崩了 {browser_deaths - 1} 次、重建后仍跑不起来，停止。')
+            break
+        if restart_browser():
+            print(f'{ts()} 重建完成，接着刷（这是第 {browser_deaths} 次重建）')
+        else:
+            sleep(10)
+        continue
+
     try:
         played = finish1video()
         consecutive_errors = 0
+        browser_deaths = 0
     except Exception as e:
+        if is_browser_gone(e):
+            # 不算"逻辑出错"，不烧重试预算 —— 交给循环开头去重建浏览器
+            print(f'{ts()} 标签页/浏览器崩溃: {type(e).__name__}: {str(e).splitlines()[0][:120]}')
+            force_restart = True
+            continue
         # 挂后台无人看守，单轮异常不能把整个任务带走
         consecutive_errors += 1
-        print(f'本轮出错（连续第 {consecutive_errors} 次）: {type(e).__name__}: {e}')
+        print(f'{ts()} 本轮出错（连续第 {consecutive_errors} 次）: {type(e).__name__}: {e}')
         if consecutive_errors >= 3:
             ABORTED_ERRORS = True
             print('连续 3 轮出错，停止。已播完的进度都已记录，重跑即可接着刷。')
@@ -818,7 +940,7 @@ while True:
     # 误报"全部播放完毕"的，其实还剩几十个没刷。
     if played is None:
         no_progress_rounds += 1
-        print(f'本轮没有任何进展（连续第 {no_progress_rounds} 次），回课程页重来')
+        print(f'{ts()} 本轮没有任何进展（连续第 {no_progress_rounds} 次），回课程页重来')
         if no_progress_rounds >= 3:
             ABORTED_NO_PROGRESS = True
             print('连续 3 轮没有任何进展，停止。这不是"刷完了"，请检查上面的警告。')
@@ -834,20 +956,27 @@ while True:
     if not played:
         break
     total_played += 1
-    print(f'—— 已播完 {total_played} 个视频，切下一个 ——')
+    print(f'{ts()} —— 已播完 {total_played} 个视频，切下一个 ——')
     back_to_course_page()
     sleep(5)  # thanks for @420xincheng's #8
 
-driver.quit()
+
+try:
+    driver.quit()
+except Exception:
+    pass   # 会话早死了的时候 quit 也会抛，没必要因此留个 traceback
 if ABORTED_NO_CLASSES:
-    print('已中止: 未找到任何小节元素，视频没有被播放，请查看上面的警告信息')
+    print(f'{ts()} 已中止: 未找到任何小节元素，视频没有被播放，请查看上面的警告信息')
 elif ABORTED_ERRORS:
-    print('已中止: 连续出错，任务没有跑完。重跑会接着刷没完成的。')
+    print(f'{ts()} 已中止: 连续出错，任务没有跑完。重跑会接着刷没完成的。')
+elif ABORTED_BROWSER:
+    print(f'{ts()} 已中止: 浏览器反复崩溃，重建也起不来（本次共播出 {total_played} 个）。')
+    print('  重跑会接着刷。若反复出现，多半是浏览器本身的问题，试试更新 Edge 或换 Chrome。')
 elif ABORTED_NO_PROGRESS:
-    print(f'已中止: 连续 3 轮没能开始播放任何视频（本次共播出 {total_played} 个）。')
+    print(f'{ts()} 已中止: 连续 3 轮没能开始播放任何视频（本次共播出 {total_played} 个）。')
     print('  这不代表刷完了。常见原因是课程页没渲染完或窗口状态异常，重跑一般能接着刷。')
 else:
-    print(f'恭喜你！全部播放完毕（本次共播出 {total_played} 个视频）')
+    print(f'{ts()} 恭喜你！全部播放完毕（本次共播出 {total_played} 个视频）')
     if SKIPPED_STALLED:
         print(f'注意: 有 {len(SKIPPED_STALLED)} 个视频因播放卡住被跳过，重跑会再试:')
         for t in SKIPPED_STALLED:
