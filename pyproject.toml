@@ -1,6 +1,6 @@
 [project]
 name = "changjiang-yuketang"
-version = "1.0.0"
+version = "1.1.0"
 description = "长江雨课堂视频自动播放器 - 基于 Selenium 的无头刷课工具"
 readme = "README.md"
 requires-python = ">=3.8"

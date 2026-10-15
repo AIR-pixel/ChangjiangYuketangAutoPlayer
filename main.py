@@ -11,13 +11,21 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.remote.webelement import WebElement
+from selenium.common.exceptions import TimeoutException
 from typing import List
 from time import sleep, monotonic, strftime
-import random
 import os
-import re
 import sys
-import configparser
+
+import firstrun
+import refresh_cookie
+
+# 必须在任何 print 之前：重定向输出时 Windows 会退回 GBK，日志里的 `✓` 那种字符
+# 会把程序打死在启动阶段；顺带把 stdout 设成逐行刷出（打包后的 exe 上实测踩到过，
+# 见 docs/技术细节.md 7）
+refresh_cookie.setup_output()
+
+PLACEHOLDER_MARK = '在此填写'  # 旧版模板里的占位符；留作识别"从没填过"的老配置文件
 
 
 def ts() -> str:
@@ -25,63 +33,64 @@ def ts() -> str:
     return strftime('%H:%M:%S')
 
 
-def create_config_template(config_path):
-    """创建config.ini模板文件"""
-    config = configparser.ConfigParser()
-    config['Settings'] = {
-        'headless': 'false',
-        'browser': 'auto',
-        'ui': 'auto',
-        'course_url': 'https://在此填写你的课程URL',
-        'cookie': '在此填写你的sessionid',
-        'speed': '2',
-        'implicitly_wait': '10'
-    }
+def pause_exit(code: int = 0):
+    """退出前停一下。
 
+    双击 exe 时控制台会随进程一起关掉，不停留就是"闪一下就没了"、用户看不到报错；
+    但输出被重定向、压根没有控制台时不能傻等，否则会挂在后台不退出。
+    """
     try:
-        with open(config_path, 'w', encoding='utf-8') as f:
-            f.write('; 长江雨课堂 配置文件\n')
-            f.write('; headless: 是否无窗口运行 (true/false)，挂后台建议 true\n')
-            f.write('; browser: chrome / edge / auto，auto 表示自动探测本机已安装的浏览器\n')
-            f.write('; ui: auto / common / legacy，雨课堂前端版本；auto 表示按域名判断，未知域名则运行时自动探测\n')
-            f.write(';     changjiang.yuketang.cn（长江雨课堂）、www.yuketang.cn 为新版(common)\n')
-            f.write('; course_url: 你的课程地址，必须包含 https:// 协议头\n')
-            f.write(';             例如: https://changjiang.yuketang.cn/v2/web/studentLog/12345678\n')
-            f.write('; cookie: 你的sessionid值，建议用 refresh_cookie.bat 自动获取\n')
-            f.write('; speed: 播放倍速，1 = 原速，2 = 两倍速（允许 0.5 ~ 4）\n')
-            f.write('; implicitly_wait: 元素查找超时时间(秒)，一般不需要修改\n\n')
-            config.write(f)
-    except Exception as e:
-        print(f'创建配置文件失败: {e}')
+        if sys.stdin is not None and sys.stdin.isatty():
+            input('按回车键退出...')
+    except Exception:
+        pass  # 控制台已关闭之类的情况，直接退
+    sys.exit(code)
 
 
-def load_config():
-    """从config.ini加载配置"""
-    config = configparser.ConfigParser()
+def config_path() -> str:
+    """config.ini 的位置。
 
-    # 优先从可执行文件所在目录查找config.ini（支持打包后的exe）
-    config_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'config.ini')
+    优先程序自己所在目录 —— exe 模式下就是 exe 旁边，冻结路径的问题由
+    refresh_cookie.app_dir() 处理；那里没有、而当前工作目录有，则沿用工作目录
+    那份，兼容以前 `python main.py` 的用法。两边都没有就返回程序目录，让向导去建。
+    """
+    beside = refresh_cookie.config_path()
+    if os.path.exists(beside):
+        return beside
+    legacy = os.path.join(os.getcwd(), 'config.ini')
+    return legacy if os.path.exists(legacy) else beside
 
-    if not os.path.exists(config_path):
-        # 如果exe目录没有，尝试从当前工作目录查找
-        config_path = os.path.join(os.getcwd(), 'config.ini')
 
-    if not os.path.exists(config_path):
-        # 如果config.ini不存在，创建模板
-        print(f'未找到配置文件，正在创建模板: {config_path}')
-        create_config_template(config_path)
-        print('\n请编辑 config.ini 文件填写你的配置信息后重新运行程序')
-        input('按回车键退出...')
-        sys.exit(0)
-
+def _cfg_text(cfg, key: str) -> str:
     try:
-        config.read(config_path, encoding='utf-8')
-        print(f'成功加载配置文件: {config_path}')
-        return config
-    except Exception as e:
-        print(f'读取配置文件失败: {e}')
-        input('按回车键退出...')
-        sys.exit(1)
+        return (cfg.get('Settings', key, fallback='') or '').strip()
+    except Exception:
+        return ''
+
+
+def needs_setup(cfg) -> bool:
+    """配置还缺东西 -> 需要走一遍首次配置向导。"""
+    url, cookie = _cfg_text(cfg, 'course_url'), _cfg_text(cfg, 'cookie')
+    return (not url.startswith('http') or not cookie
+            or PLACEHOLDER_MARK in url or PLACEHOLDER_MARK in cookie)
+
+
+def load_config(path: str):
+    """读配置；缺 course_url / cookie 就先跑一遍首次配置向导。
+
+    用户那边的动作是"双击 exe"，不是"先读文档再手填文件"，所以这一步必须自动完成。
+    """
+    if needs_setup(refresh_cookie.read_config(path)):
+        if not firstrun.ensure_ready(path):
+            print('\n配置没有完成，已退出。')
+            pause_exit(1)
+
+    cfg = refresh_cookie.read_config(path)
+    if not cfg.has_section('Settings'):
+        print(f'\n配置文件缺少 [Settings] 段，可能已损坏: {path}')
+        pause_exit(1)
+    print(f'配置就绪: {path}')
+    return cfg
 
 
 # 加载配置
@@ -89,39 +98,49 @@ print('='*50)
 print('长江雨课堂 - 视频自动播放器')
 print('='*50)
 
-config = load_config()
+CONFIG_PATH = config_path()
+config = load_config(CONFIG_PATH)
 
 # 读取配置项
 try:
-    IF_HEADLESS = config.getboolean('Settings', 'headless', fallback=False)
+    # headless 缺省为 true：挂后台是主要用法，也和 README / config.ini.example 写的一致
+    IF_HEADLESS = config.getboolean('Settings', 'headless', fallback=True)
     BROWSER = config.get('Settings', 'browser', fallback='auto').strip().lower()
     UI_MODE = config.get('Settings', 'ui', fallback='auto').strip().lower()
-    COURSE_URL = config.get('Settings', 'course_url', fallback='')
-    COOKIE = config.get('Settings', 'cookie', fallback='')
+    COURSE_URL = _cfg_text(config, 'course_url')
+    COOKIE = _cfg_text(config, 'cookie')
     PLAYBACK_SPEED = config.getfloat('Settings', 'speed', fallback=2.0)
     IMPLICITLY_WAIT = config.getint('Settings', 'implicitly_wait', fallback=10)
 except Exception as e:
     print(f'\n配置文件格式错误: {e}')
-    input('按回车键退出...')
-    sys.exit(1)
+    pause_exit(1)
 
-# 验证配置
-if not COURSE_URL or not COOKIE or '在此填写' in COURSE_URL or '在此填写' in COOKIE:
-    print('\n错误: 检测到配置文件未正确填写!')
-    print('请编辑 config.ini 文件，填写正确的 course_url 和 cookie')
-    input('按回车键退出...')
-    sys.exit(1)
+# 走到这里还缺东西，说明向导被人中途掐掉了，或者文件被手改坏了
+if needs_setup(config):
+    print(f'\n错误: 配置里缺少可用的 course_url / cookie: {CONFIG_PATH}')
+    print('重新运行本程序会再走一遍配置向导；也可以参考 config.ini.example 手动填写。')
+    pause_exit(1)
 
 # 倍速限幅：太低没意义，太高播放器会直接拒
 PLAYBACK_SPEED = min(4.0, max(0.5, PLAYBACK_SPEED))
 
-# selenium 客户端会读取 HTTP(S)_PROXY 环境变量。若不排除本机地址，
-# 发往本地 WebDriver 端口的请求会被代理劫持，命令一律返回 "unhandled request"。
-for _proxy_env in ('NO_PROXY', 'no_proxy'):
-    _bypass = [h for h in ('localhost', '127.0.0.1', '::1') if h not in os.environ.get(_proxy_env, '')]
-    if _bypass:
-        _old = os.environ.get(_proxy_env, '').strip(',')
-        os.environ[_proxy_env] = f'{_old},{",".join(_bypass)}'.strip(',')
+# 扫码登录最多等多久。无头模式下窗口不可见、根本没法扫，所以到时如实报错退出，
+# 而不是无界地挂在那里（挂后台时"既不报错也不退出"比直接失败更难排查）。
+QR_LOGIN_TIMEOUT = 300
+
+# 页面加载上限。配合 create_driver 里的 page_load_strategy='eager'，正常情况几秒就返回，
+# 真挂满这个数说明站点或网络确实出事了。设了上限 `driver.get` 才会抛 Selenium 的
+# TimeoutException；不设的话会一路挂到 urllib3 的 120 秒读超时，抛出来的是 urllib3 的
+# 异常，上层没法按"这一轮出错了"处理（2026-10-15 实测遇到过一次）。
+PAGE_LOAD_TIMEOUT = 90
+
+# 视频页"<video> 元素出现"的等待上限。见下方 WebDriverWait 处的说明：
+# page_load_strategy='eager' 之后这段等待要负责播放器渲染的时间。
+VIDEO_READY_TIMEOUT = 20
+
+# selenium 客户端会读取 HTTP(S)_PROXY，不排除本机地址的话发往 WebDriver 端口的请求
+# 会被代理劫持、命令一律返回 "unhandled request"。run.bat 里也设了一份，这里再兜一次。
+refresh_cookie.bypass_proxy_for_localhost()
 
 BROWSER_PATHS = {
     'chrome': [
@@ -153,13 +172,12 @@ def create_driver():
         '--autoplay-policy=no-user-gesture-required',
         '--disable-blink-features=AutomationControlled',
         '--window-size=1920,1080',
-        # ---- 压制渲染进程崩溃（2026-10-11 实测，详见 docs/技术细节.md）----
-        # 该站视频播到几分钟后，Edge 的渲染进程会以固定的
-        #   msedge.dll +0x556c74d  ACCESS_VIOLATION（0xC0000005）
-        # 崩掉（崩溃转储里 17/17 个地址完全一致）。崩溃进程加载着整套硬件解码链
-        # （mfx_mft_vp9ve_64 / mfx_mft_h264ve_64 / igd11dxva64 / nvEncMFTH264x ...）。
-        # 强制走软件解码并把 GPU 相关路径关掉，实测存活时间从 ~75s 拉到 ~296s。
-        # 没能根除，所以循环里还配了"崩了就重建浏览器"的兜底。
+        # ---- 压制渲染进程崩溃（2026-10-11 实测，详见 docs/技术细节.md 2.5）----
+        # 该站视频播到几分钟后，Edge 渲染进程会以固定的 msedge.dll +0x556c74d
+        # ACCESS_VIOLATION 崩掉（17 个转储地址完全一致），崩时加载着整套硬件解码链。
+        # 强制软件解码 + 关掉 GPU 路径后存活时间 ~147s → ~593s，之后连跑 19 分 49 秒
+        # 零崩溃。看数据像是治住了，但没拿到"绝不会再崩"的证据，所以主循环里
+        # 仍保留"崩了就重建浏览器"的兜底。
         '--disable-accelerated-video-decode',
         '--disable-accelerated-video-encode',
         '--disable-gpu',
@@ -170,14 +188,22 @@ def create_driver():
         '--disable-features=CalculateNativeWinOcclusion',
     ]
     if IF_HEADLESS:
-        # 后台跑：不给窗口，也不出声
-        extra.append('--headless=new' if BROWSER_NAME == 'edge' else '--headless')
+        # 后台跑：不给窗口，也不出声。
+        # 两家都是 Chromium，一律走新版无头 —— 旧版无头在 132+ 已被移除。
+        extra.append('--headless=new')
         extra.append('--mute-audio')
     if BROWSER_NAME == 'edge':
         from selenium.webdriver.edge.options import Options as EdgeOptions
         option = EdgeOptions()
     else:
         option = webdriver.ChromeOptions()
+    # 就绪即返回：等到 DOMContentLoaded，而不是等整个 load 事件。
+    # 这站是 SPA 且挂着常驻连接，load 事件可能永远不触发 → `driver.get` 于是一路挂满
+    # page_load_timeout。实测（tools/diag_startup.py，2026-10-15）：
+    #   normal: 首页 90.00s + 课程页 90.01s = 180s，而且超时之后页面其实早就好了
+    #   eager : 首页  2.62s + 课程页 20.83s =  23s
+    # 异步渲染本来就有 sleep + 重试 + UNITS_RENDERED_JS 兜着，不用靠 load 事件保证。
+    option.page_load_strategy = 'eager'
     for arg in extra:
         option.add_argument(arg)
     if BROWSER_NAME == 'edge':
@@ -186,6 +212,15 @@ def create_driver():
 
 
 BROWSER_NAME = detect_browser()
+
+
+def setup_driver(d):
+    """新建 driver 之后的统一初始化。启动和崩溃重建共用，避免两处各写一遍。"""
+    if not IF_HEADLESS:
+        d.maximize_window()
+    d.implicitly_wait(IMPLICITLY_WAIT)
+    d.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    return d
 
 # 雨课堂有两套前端。新版(COMMONUI)的小节元素是 study-unit、视频标记是 span.leaf-flag；
 # 旧版的小节元素是 leaf-detail、视频标记是 i.icon--shipin。
@@ -206,29 +241,34 @@ elif any(host in homePageURL for host in COMMONUI_HOSTS):
 else:
     IS_COMMONUI = None  # 未知域名，留给 load_classes() 按 DOM 自动探测
 
-print(f'\n配置信息:')
+print('\n配置信息:')
 print(f'  无窗口模式: {IF_HEADLESS}')
 print(f'  浏览器: {BROWSER_NAMES[BROWSER_NAME]}')
 print(f'  课程URL: {COURSE_URL[:50]}...' if len(COURSE_URL) > 50 else f'  课程URL: {COURSE_URL}')
 print(f'  雨课堂站点: {homePageURL}')
 print(f'  UI 版本: { {True: "新版(common)", False: "旧版(legacy)", None: "待自动探测"}[IS_COMMONUI] }')
 print(f'  播放倍速: {PLAYBACK_SPEED}x')
-print(f'  Cookie已配置: ✓')
+print('  Cookie已配置: ✓')
 print('='*50 + '\n')
 
+# 启动浏览器。这一步 + 首次打开课程页实测要几十秒（建进程、Selenium Manager 找驱动、
+# 首页跳转、小节列表渲染），中间本来一个字符都不输出 —— 双击 exe 的人会以为程序死了。
+# 所以从这里到第一次扫描之间都补了阶段提示，既给用户反馈，也让日志能看出时间花在哪。
+print(f'{ts()} 启动浏览器（{BROWSER_NAMES[BROWSER_NAME]}，{"无窗口" if IF_HEADLESS else "有窗口"}）...')
+driver = setup_driver(create_driver())
+print(f'{ts()} 浏览器就绪')
 
-driver = create_driver()
-if not IF_HEADLESS:
-    driver.maximize_window()
-driver.implicitly_wait(IMPLICITLY_WAIT)
 
-def str2dic(s):
-    d = dict()
-    for i in s.split('; '):
-        temp = i.split('=')
-        d[temp[0]] = temp[1]
-    return d
+def _get(url):
+    """driver.get 的容错版：站点抽风导致加载超时时，页面往往已经能用了。
 
+    挂后台跑一整晚，网络抖一下很常见。这里不让它把整轮任务作废 —— 超时也接着往下走，
+    由调用方的"等元素"逻辑去判断页面到底能不能用。
+    """
+    try:
+        driver.get(url)
+    except TimeoutException:
+        print(f'  提示: 打开页面超时（{PAGE_LOAD_TIMEOUT}s），继续尝试使用当前页面')
 
 def setCookie(cookies):
     driver.delete_all_cookies()
@@ -236,87 +276,70 @@ def setCookie(cookies):
         driver.add_cookie({'name': name, 'value': value, 'path': '/'})
 
 
-def ifVideo(div: WebElement):
-    for i in div.find_elements(By.TAG_NAME, 'i'):
-        i_class = i.get_attribute('class')
-        if 'icon--suo' in i_class:  # 锁的图标，表明视频未开放
-            return False
-    
-    if IS_COMMONUI:  # www.yuketang.cn，非grsbupt.yuketang.cn，属新版ui
-        try:
-            span = div.find_element(By.CSS_SELECTOR, 'span.leaf-flag')
-        except:
-            return False
-        return '视频' in span.text.strip()
-    
-    try:
-        i = div.find_element(By.TAG_NAME, 'i')
-    except:
-        return False  # 每个小结后面都存在空行<li>
-    i_class = i.get_attribute('class')
-    return 'icon--shipin' in i_class
-
-
-def is_finished(unit: WebElement):
-    """判断学习单元是否已完成。
-
-    "完成情况"列的呈现各站不同：有的直接写"已完成"文字，长江雨课堂显示完成百分比
-    （实测文本形如 "9.8%" / "100%"，里面没有"已完成"字样）。若只用文字判断，
-    已刷完的视频会被当成未完成反复重播。
-    """
-    if '已完成' in unit.text:
-        return True
-    try:
-        complete_text = unit.find_element(By.CLASS_NAME, 'complete-td').text
-    except Exception:
-        return False  # 取不到完成情况列，交给上层按旧口径处理
-    pcts = re.findall(r'(\d+(?:\.\d+)?)\s*%', complete_text)
-    return bool(pcts) and float(pcts[0]) >= 99.9
-
-
 PLAYED_TITLES = set()  # 本次运行已播过/已放弃的标题，保证无人看守时绝不会原地打转
 SKIPPED_STALLED = []   # 因卡住被跳过的标题，收尾时如实汇报
 
 
-def video_title(unit: WebElement) -> str:
-    """取小节标题。返回空串时必须被上层当成"页面还没渲染完"，不能当成合法标题。
+# 一次 JS 扫描，挑出「下一个该播的小节」并**直接返回元素句柄**。
+#
+# 旧实现每个小节要发 6 次元素查询，81 个小节一轮 28~31 秒；信息本来就在 DOM 里，
+# 合并成一次 execute_script 后实测 0.019 秒。另外旧实现读 Selenium 的 element.text
+# （渲染文本），它会把 study-unit / complete-td 这一层间歇性读成空串 ——
+# 那样已完成的小节会被判成没完成、被重播；这里统一用 textContent。
+# 判定口径、实测数据、差分比对过程见 docs/技术细节.md 2.7。
+SCAN_TARGET_JS = '''
+var mode = arguments[0], played = arguments[1];
+var common = (mode === 'common');
+var units = document.querySelectorAll(common ? '.study-unit' : '.leaf-detail');
+var st = {total: units.length, locked: 0, notVideo: 0, expired: 0, done: 0,
+          played: 0, blankTitle: 0, pending: 0};
+var picked = null, pickedTitle = '';
+for (var i = 0; i < units.length; i++) {
+    var u = units[i];
+    var txt = u.textContent || '';
+    if (u.querySelector('i.icon--suo')) { st.locked++; continue; }
+    var isVideo;
+    if (common) {
+        var flag = u.querySelector('span.leaf-flag');
+        isVideo = !!(flag && flag.textContent.trim().indexOf('视频') >= 0);
+    } else {
+        var firstI = u.querySelector('i');
+        isVideo = !!(firstI && (firstI.getAttribute('class') || '').indexOf('icon--shipin') >= 0);
+    }
+    if (!isVideo) { st.notVideo++; continue; }
+    if (txt.indexOf('截止') >= 0) { st.expired++; continue; }
+    var done = txt.indexOf('已完成') >= 0;
+    if (!done) {
+        var ct = u.querySelector('.complete-td');
+        if (ct) {
+            var m = /(\\d+(?:\\.\\d+)?)\\s*%/.exec(ct.textContent || '');
+            if (m && parseFloat(m[1]) >= 99.9) { done = true; }
+        }
+    }
+    if (done) { st.done++; continue; }
+    var nt = u.querySelector('span.name-text');
+    var title = nt ? (nt.textContent || '').trim()
+                   : txt.replace(/\\s+/g, ' ').trim().slice(0, 60);
+    // 空标题不登记、也不能当合法候选：那多半是课程页先吐了骨架、标题还没填，
+    // 拿它往下走会把整轮带偏（详见 docs/技术细节.md 2.3）
+    if (!title) { st.blankTitle++; continue; }
+    if (played.indexOf(title) >= 0) { st.played++; continue; }
+    if (picked) { st.pending++; continue; }
+    picked = u;
+    pickedTitle = title;
+}
+return [picked, pickedTitle, st];
+'''
 
-    反例（2026-10-11 实跑踩到）：把空串写进 PLAYED_TITLES 之后，所有同样取不到标题的
-    小节都会被 need_play 判成"已播过"，任务被误判成"全部播放完毕"——明明还剩几十个没刷。
-    所以这里区分两种"取不到"：name-text 元素根本不存在（旧版 UI）走整块文本兜底；
-    name-text 存在但内容为空，说明列表渲染到一半，返回空串让上层重来。
+
+def scan_target(mode: str):
+    """挑选下一个要播的小节。返回 (元素, 标题, 统计)；没有候选时元素为 None。
+
+    返回的标题保证非空 —— 空标题一律不算候选，避免"页面没渲染完"被当成
+    "这些小节都播过了"（2026-10-11 实跑就是这么误报"全部播放完毕"的）。
     """
-    try:
-        el = unit.find_element(By.CSS_SELECTOR, 'span.name-text')
-    except Exception:
-        return ' '.join(unit.text.split())[:60]
-    return el.text.strip()
-
-
-def need_play(unit: WebElement):
-    """该单元是视频、未过期、尚未完成、且本次还没播过"""
-    return (ifVideo(unit)
-            and '截止' not in unit.text
-            and not is_finished(unit)
-            and video_title(unit) not in PLAYED_TITLES)
-
-
-def getAllvideos_notFinished(allClasses: List[WebElement]):
-    driver.implicitly_wait(0.1)  # 找不到元素时会找满implicitly_wait秒
-    allVideos = []
-    for thisClass in allClasses:
-        if need_play(thisClass):
-            print(f'找到未完成的视频: {thisClass.text.strip()}')
-            allVideos.append(thisClass)
-    driver.implicitly_wait(IMPLICITLY_WAIT)
-    return allVideos
-
-
-def get1video_notFinished(allClasses: List[WebElement]):
-    for thisClass in allClasses:
-        if need_play(thisClass):
-            return thisClass
-    return None
+    el, title, st = driver.execute_script(SCAN_TARGET_JS, mode, list(PLAYED_TITLES))
+    return el, title, st
 
 
 def at_login_page():
@@ -331,11 +354,11 @@ def at_login_page():
         return True
     driver.implicitly_wait(0.1)
     try:
-        driver.find_element(By.CLASS_NAME, 'login-btn')
-        logged_out = True
+        logged_out = bool(driver.find_element(By.CLASS_NAME, 'login-btn'))
     except Exception:
         logged_out = False
-    driver.implicitly_wait(IMPLICITLY_WAIT)
+    finally:
+        driver.implicitly_wait(IMPLICITLY_WAIT)
     return logged_out
 
 
@@ -345,9 +368,10 @@ def goto_course_page(allow_qr=True) -> bool:
     启动时和「浏览器崩了重建之后」都走这里，保证两条路径行为一致。
     重建时传 allow_qr=False —— 那时候不该停下来等人扫码。
     """
-    driver.get(homePageURL)
+    print(f'{ts()} 打开课程页...')
+    _get(homePageURL)
     setCookie({'sessionid': COOKIE})
-    driver.get(COURSE_URL)
+    _get(COURSE_URL)
     sleep(3)
     if not at_login_page():
         return True
@@ -355,13 +379,27 @@ def goto_course_page(allow_qr=True) -> bool:
         print('  重建后仍停在登录页 —— cookie 可能已失效，请重跑 refresh_cookie.bat')
         return False
     print('cookie失效或设置有误，请重设cookie或选择每次扫码登录')
-    driver.get(homePageURL)
-    driver.find_element(By.CLASS_NAME, 'login-btn').click()
-    print("请扫码登录")
-    while 'courselist' not in driver.current_url:  # 判断是否已经登录成功
-        sleep(0.5)
+    if IF_HEADLESS:
+        print('  提示: 当前是 headless 模式，扫码窗口不可见；要扫码请先把 headless 改成 false')
+    _get(homePageURL)
+    try:
+        driver.find_element(By.CLASS_NAME, 'login-btn').click()
+    except Exception as e:
+        print(f'  找不到登录按钮（{type(e).__name__}），无法进入扫码登录')
+        return False
+    print(f'请扫码登录（最多等 {QR_LOGIN_TIMEOUT // 60} 分钟）')
+    # 判据是"离开了登录页"，不是 URL 里出现 courselist。
+    # 上游那版等的是 'courselist' in current_url —— 新版 UI 登录成功后落的是
+    # /v2/web/index，而且 /v2/web/courselist 会 302 到 /v2/web/errpage，
+    # 这个判据在这站永远不成立，会一路等到超时（2026-10-15 实测确认）。
+    deadline = monotonic() + QR_LOGIN_TIMEOUT
+    while at_login_page():
+        if monotonic() > deadline:
+            print(f'  等扫码超时（{QR_LOGIN_TIMEOUT}s），放弃本次登录')
+            return False
+        sleep(1)
     print('登录成功')
-    driver.get(COURSE_URL)
+    _get(COURSE_URL)
     return True
 
 
@@ -405,10 +443,7 @@ def restart_browser() -> bool:
         pass
     sleep(3)
     try:
-        driver = create_driver()
-        if not IF_HEADLESS:
-            driver.maximize_window()
-        driver.implicitly_wait(IMPLICITLY_WAIT)
+        driver = setup_driver(create_driver())
     except Exception as e:
         print(f'  重建浏览器失败: {type(e).__name__}: {str(e).splitlines()[0][:120]}')
         return False
@@ -419,16 +454,17 @@ def restart_browser() -> bool:
         return False
 
 
-# homePageURL 与 IS_COMMONUI 已在读取配置后确定
-goto_course_page()
+# 进课程页。失败（停在登录页且等扫码超时）就别往下跑了 ——
+# 硬跑只会在课程页之外乱点，最后报一堆找不到小节的警告。
+if not goto_course_page():
+    print('未能进入课程页，退出。请先跑 refresh_cookie.bat 刷新 sessionid，或把 headless 改成 false 手动扫码。')
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    sleep(3)
+    sys.exit(1)
 
-
-GET_VIDEO_JS = (
-    # 优先现取现用：播放器会卸载重建 <video>，全局变量可能指向已脱离文档的旧元素
-    'var v = document.querySelector("video");'
-    'if (!v && typeof video !== "undefined" && video) { v = video; }'
-    'if (!v) { return null; }'
-)
 
 PLAYER_LOCK_JS = '''
 (function (cfg) {
@@ -477,24 +513,13 @@ PLAYER_LOCK_JS = '''
 def change2speed2():
     """把播放速度锁到配置的倍速（默认 2 倍），顺带把静音也锁住。
 
-    实测（2026-10-11，长江雨课堂 changjiang.yuketang.cn）：
+    播放器每约 250ms 会把倍速同步回自己内部的 1x 状态，硬对抗没用。做法是给
+    HTMLMediaElement.prototype.playbackRate 装一层 setter，把"往低调"的写入直接
+    丢弃 —— 实际值不变，就不会触发 ratechange，也就没有自激循环。锁装在原型上
+    （播放器中途换掉 <video> 也不怕），另有 1 秒定时器兜底。站点自带的倍速 UI 是死路。
 
-      * 播放器自带的倍速 UI 点不动：xt-speedbutton 展开后，用 CDP 原生鼠标事件
-        确实打到了 li（isTrusted=true、列表保持展开、元素未被遮挡），
-        但 xt-speedvalue 不变、playbackRate 不变。那条路是死的，不走近它。
-      * 直接写 video.playbackRate = 2，同步读回是 2，约 200ms 后就被改回 1。
-        调用栈定位到播放器 chunk 27437.3f1750f6.js：它在 ratechange/timeupdate
-        里把倍速同步回自己内部的 1x 状态，约每 250ms 改一次。
-      * 正确做法不是对抗、而是"吞掉调低的写入"：给 HTMLMediaElement.prototype
-        的 playbackRate 装一层 setter，凡是想写到目标值以下的，直接丢弃。
-        播放器改不动实际值，也就不会反复重写，不会死循环。
-        实测 12 秒内 currentTime 前进 23.6s / 墙钟 11.79s = 2.002x，paused=false，
-        期间拦掉 49 次播放器复位。
-      * 锁装在原型上而不是某个 video 元素上，所以播放器中途换掉 <video> 也不怕；
-        再配一个 1 秒定时器兜底补刀。
-
-    副作用：播放器自己的 UI 仍显示 1.00X（它内部状态没被改），纯显示问题，
-    不影响实际倍速，也不影响播放与自动切集。
+    副作用：播放器 UI 仍显示 1.00X（它的内部状态没被改），纯显示问题。
+    判断真实速率要看 currentTime 推进量，不能读 playbackRate。实测见 docs/技术细节.md §3。
     """
     try:
         r = driver.execute_script(PLAYER_LOCK_JS, {'speed': PLAYBACK_SPEED, 'mute': True})
@@ -525,24 +550,6 @@ def change2speed2():
         print(f'警告: 倍速没锁住，当前 {now}x（不影响播放与切集，但会按原速跑）')
 
 
-def mute1video():
-    """静音。走 video.muted，不依赖 xt-volumebutton。
-
-    这里刻意不读 main.py 里的全局 video 变量：播放器会卸载重建 <video>，
-    拿旧变量可能对着一个已脱离文档的僵尸元素静音，而真正在播的那个照样出声。
-    """
-    try:
-        return driver.execute_script(
-            'var v = document.querySelector("video");'
-            'if (!v) { return null; }'
-            'v.muted = true;'
-            'return v.muted;'
-        )
-    except Exception as e:
-        print(f'警告: 静音失败（不影响播放与切集）: {type(e).__name__}: {e}')
-        return None
-
-
 def js_click(element):
     """雨课堂部分站点（实测长江雨课堂课程页）上元素虽存在但原生 click 会抛
     ElementNotInteractableException，统一改走 JS 点击。"""
@@ -551,14 +558,11 @@ def js_click(element):
 
 # 点标题前注入：把站点的 window.open 收编，并改写 target=_blank。
 #
-# 为什么非要这么做（2026-10-11 实跑踩到）：原先是"让它开新标签页 → 播完再 close"，
-# 结果 driver.close() 在这站偶发卡死 20 秒（failed to close window in 20 seconds），
-# 窗口管理当场错乱，后面连着几轮全废。
-# 实测该站就是调 window.open(url, '_blank') 打开视频页的，把这个 URL 截下来以后
-# 在当前标签页直接 driver.get(url) 一样能出可播的视频页 —— 全程只有一个窗口，
-# 不需要 close，也就没有卡死的可能。
-# window.open 必须返回一个假窗口对象：站点拿到返回值会调 focus()/close()，
-# 直接返回 null 会让它内部抛错，可能连 URL 都不给。
+# 原先是"让它开新标签页 → 播完再 close"，但该站 driver.close() 会偶发卡死 20 秒，
+# 窗口状态一乱后面几轮全废。既然它就是用 window.open(url, '_blank') 打开视频页的，
+# 把这个 URL 截下来、在当前标签页 driver.get(url) 即可 —— 全程单窗口，没有 close 可卡。
+# window.open 必须返回一个假窗口对象（站点会调 focus()/close()），返回 null 会让它内部抛错。
+# 细节见 docs/技术细节.md 2.4。
 CAPTURE_VIDEO_URL_JS = '''
 (function () {
     if (!window.__ytOpenPatched) {
@@ -584,21 +588,17 @@ CAPTURE_VIDEO_URL_JS = '''
 '''
 
 
-def _units_rendered(units) -> bool:
-    """小节列表是否渲染出了标题。
-
-    实测（2026-10-11 实跑）：课程页偶尔会先吐出 80 多个空的 study-unit 骨架、
-    标题稍后才填上。此时若直接往下走，取到的是空标题，会把整轮任务带偏
-    （见 video_title 的说明）。宁可重载一次课程页，也别拿半成品往下跑。
-    """
-    driver.implicitly_wait(0.1)
-    try:
-        for u in units[:5]:
-            if video_title(u):
-                return True
-        return False
-    finally:
-        driver.implicitly_wait(IMPLICITLY_WAIT)
+# 小节列表是否渲染出了标题。实测（2026-10-11 实跑）：课程页偶尔会先吐出 80 多个
+# 空的 study-unit 骨架、标题稍后才填上。此时若直接往下走只会取到空标题，把整轮带偏。
+# 宁可重载一次课程页，也别拿半成品往下跑。
+UNITS_RENDERED_JS = '''
+var us = document.querySelectorAll('.study-unit');
+for (var i = 0; i < us.length && i < 5; i++) {
+    var nt = us[i].querySelector('span.name-text');
+    if (nt && (nt.textContent || '').trim()) { return true; }
+}
+return false;
+'''
 
 
 def load_classes() -> List[WebElement]:
@@ -629,15 +629,16 @@ def load_classes() -> List[WebElement]:
         return driver.find_elements(By.CLASS_NAME, 'leaf-detail')
 
     if IS_COMMONUI:
+        print(f'{ts()} 读取小节列表...')
         units = []
         for attempt in (1, 2, 3):
             click_report_tab()
             sleep(2)  # 小节列表是点完标签后异步渲染的，给渲染留点时间
             units = driver.find_elements(By.CLASS_NAME, 'study-unit')
-            if not units or _units_rendered(units):
+            if not units or driver.execute_script(UNITS_RENDERED_JS):
                 return units
             print(f'提示: 小节列表出来了但标题还是空的（第 {attempt} 次），重新加载课程页')
-            driver.get(COURSE_URL)
+            _get(COURSE_URL)
             sleep(4)
         return units
     return driver.find_elements(By.CLASS_NAME, 'leaf-detail')
@@ -645,20 +646,16 @@ def load_classes() -> List[WebElement]:
 
 ABORTED_NO_CLASSES = False  # 因为一个小节都没找到而中止，结尾不能报"播放完毕"
 ABORTED_ERRORS = False      # 连续出错而中止
+LOCKED_VIDEOS = 0           # 页面上处于「未开放」（带锁）状态的视频数 —— 有它就别说"全部刷完"
 
 
 def back_to_course_page():
     """确保回到课程页，并且不留下多余窗口。
 
-    正常情况下现在只有 1 个窗口（点标题不再开新标签页，见 CAPTURE_VIDEO_URL_JS），
-    这里主要是兜底：万一哪一轮 window.open 拦截没生效、真开了新标签页，
-    必须把它清掉，否则下一轮点击又会多开一个，窗口越堆越多。
-
-    但 close 本身在这站有概率卡住 20 秒（2026-10-11 实跑：
-    "failed to close window in 20 seconds"），所以：
-      - 循环有上限，绝不无限重试；
-      - close 失败就把那个窗口导航到 about:blank，至少别让它停在视频页继续占资源；
-      - 无论如何最后都重定向回课程页。
+    正常只有 1 个窗口（见 CAPTURE_VIDEO_URL_JS），这里主要是兜底：万一哪一轮
+    window.open 拦截没生效、真开了新标签页，必须清掉，否则下一轮会再开一个。
+    但 close 在这站有概率卡住 20 秒，所以循环有上限、失败就转 about:blank，
+    绝不无限重试（详见 docs/技术细节.md 2.4）。
     """
     for _ in range(3):
         handles = driver.window_handles
@@ -689,15 +686,20 @@ def back_to_course_page():
         driver.switch_to.window(driver.window_handles[0])
     except Exception as e:
         print(f'  切换回主窗口时出错（继续）: {type(e).__name__}: {e}')
-    driver.get(COURSE_URL)
+    _get(COURSE_URL)
     if len(driver.window_handles) > 1:
         print(f'  注意: 当前仍有 {len(driver.window_handles)} 个窗口，下一轮可能会受影响')
 
 
 def dump_dom():
-    """一个小节都找不到时，把现场落盘，便于比对站点 UI 结构差异"""
+    """一个小节都找不到时，把现场落盘，便于比对站点 UI 结构差异。
+
+    落到**程序所在目录**（和 config.ini 一个地方）：双击 exe 启动时工作目录未必是那里，
+    用相对路径会把文件丢到用户根本想不到、也找不到的地方。
+    """
+    path = os.path.join(refresh_cookie.app_dir(), '_debug_page_source.html')
     try:
-        with open('_debug_page_source.html', 'w', encoding='utf-8') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(driver.page_source)
         counts = {}
         for el in driver.find_elements(By.XPATH, '//*[@class]'):
@@ -705,13 +707,13 @@ def dump_dom():
                 counts[c] = counts.get(c, 0) + 1
         top = sorted(counts.items(), key=lambda kv: -kv[1])[:15]
         print('  页面 class 采样(出现最多): ' + ', '.join(f'{k}x{v}' for k, v in top))
-        print(f'  页面源码已保存: {os.path.abspath("_debug_page_source.html")}')
+        print(f'  页面源码已保存: {path}')
     except Exception as e:
         print(f'  现场落盘失败: {e}')
 
 
 def finish1video():
-    global ABORTED_NO_CLASSES
+    global ABORTED_NO_CLASSES, LOCKED_VIDEOS
     allClasses = load_classes()
     if not allClasses:
         # 必须显式告警：否则会一路 return False，主循环结束并打印"全部播放完毕"，
@@ -724,19 +726,20 @@ def finish1video():
         print('  常见原因: 课程页没加载完 / 未登录成功 / 该站点 UI 结构与已知两套都不同')
         dump_dom()
         return False
-    print(f'{ts()} 正在寻找未完成的视频，请耐心等待')
-    allVideos = getAllvideos_notFinished(allClasses)
-    if not allVideos:
+    video, title, st = scan_target('common' if IS_COMMONUI else 'legacy')
+    if video is None:
+        if st['blankTitle']:
+            # 有视频小节、标题却全是空的 = 课程页先吐了骨架。绝不能当成"没有未完成视频了"
+            # 收工（2026-10-11 就是这么误报"全部播放完毕"的，其实还剩几十个没刷）。
+            print(f'{ts()} 警告: {st["blankTitle"]} 个视频小节取不到标题，课程页很可能没渲染完，本轮放弃重来')
+            return None
+        LOCKED_VIDEOS = st['locked']
+        print(f'{ts()} 没有未完成的视频了（小节 {st["total"]} 个: 已完成 {st["done"]}, '
+              f'未开放 {st["locked"]}, 已过期 {st["expired"]}, 本次已播 {st["played"]}, '
+              f'非视频 {st["notVideo"]}）')
         return False
-    video = allVideos[0]
-    title = video_title(video)
-    if not title:
-        # 关键防线：空标题绝不能进 PLAYED_TITLES。否则这一轮的"页面没渲染完"
-        # 会被永久记成"这些小节都播过了"，下一轮直接报"全部播放完毕"收工。
-        print(f'{ts()} 警告: 选中的小节连标题都取不到，课程页很可能没渲染完，本轮放弃重来')
-        return None
     PLAYED_TITLES.add(title)
-    print(f'{ts()} 目标: {title}')
+    print(f'{ts()} 目标: {title}（本次还剩 {1 + st["pending"]} 个视频待播）')
     driver.execute_script('arguments[0].scrollIntoView(false);', video)
     # 先收编 window.open，再点标题 —— 这样它不会开新标签页，只把视频 URL 交出来。
     try:
@@ -775,23 +778,23 @@ def finish1video():
         opened_new_window = False
         if video_url:
             # 拦截生效：URL 拿到了，但当前页没动，需要自己跳过去
-            driver.get(video_url)
+            _get(video_url)
             print(f'{ts()} 正在播放（当前标签页直达视频页）')
         else:
             print(f'{ts()} 正在播放（站点自己完成了当前页跳转）')
 
     def leave_video_window():
-        """离开视频页。先把注入拆干净，再处理窗口。
+        """离开视频页：先把注入拆干净，再处理窗口。
 
-        不管后面走哪个分支，第一步都必须是"停掉自己注入的定时器和监听、置 __ytDone"，
-        否则页面卸载时会和播放器打架，close 直接卡死 20 秒
-        （2026-10-11 实跑：failed to close window in 20 seconds）。
+        第一步必须是"停掉注入的定时器、置 __ytDone、清 onbeforeunload"，
+        否则页面卸载时会和播放器打架，close 直接卡死 20 秒。
         """
         try:
             driver.execute_script(
                 'window.__ytDone = true;'
                 'try { clearInterval(window.__ytTimer); } catch (e) {}'
-                'try { clearInterval(videoPlay); } catch (e) {}'
+                'try { clearInterval(window.__ytResumeTimer); } catch (e) {}'
+                'try { clearInterval(window.__ytFinishTimer); } catch (e) {}'
                 'try { window.onbeforeunload = null; } catch (e) {}'
             )
         except Exception:
@@ -808,20 +811,47 @@ def finish1video():
                 print(f'  关闭视频窗口时出错（继续）: {type(e).__name__}: {first_line}')
 
     try:
-        WebDriverWait(driver, 10).until(lambda x: driver.execute_script('video = document.querySelector("video"); console.log(video); return video;'))  # 这里即使2次sleep3s选中的video还是null
+        # 只判断 <video> 出没出现，不把元素句柄搬回 Python。
+        # 顺带说明：这里刻意不写全局 video 变量 —— 播放器会卸载重建 <video>，
+        # 留一个全局引用等于随时可能对着已脱离文档的僵尸元素操作。
+        #
+        # 20 秒：page_load_strategy='eager' 之后视频页是"DOM 就绪就返回"，
+        # 播放器把 <video> 建出来还要一点时间，这段余量由这个显式等待承担
+        # （元素一出现就立刻返回，正常路径不会多花时间）。
+        WebDriverWait(driver, VIDEO_READY_TIMEOUT).until(
+            lambda x: x.execute_script('return !!document.querySelector("video");'))
     except Exception:
         # 视频页没起来（实测会发生在上一轮窗口状态已经乱了的时候）。
         # 明确报"本轮没进展"，并把注入拆干净再退出，别把异常丢给主循环。
-        print(f'{ts()} 警告: 视频页 10 秒内没有出现 video 元素，本轮放弃')
+        print(f'{ts()} 警告: 视频页 {VIDEO_READY_TIMEOUT} 秒内没有出现 video 元素，本轮放弃')
         leave_video_window()
         return None
 
-    driver.execute_script('videoPlay = setInterval(function() {var v = document.querySelector("video"); if (v && v.paused) {v.play();}}, 200);')
-    driver.execute_script('setTimeout(() => clearInterval(videoPlay), 5000)')
-    driver.execute_script('addFinishMark = function() {finished = document.createElement("span"); finished.setAttribute("id", "LetMeFly_Finished"); document.body.appendChild(finished); console.log("Finished");}')
-    driver.execute_script('lastDuration = 0; setInterval(() => {var v = document.querySelector("video"); if (!v) {return;} nowDuration = v.currentTime; if (nowDuration < lastDuration) {addFinishMark()}; lastDuration = nowDuration}, 200)')
+    # 开场几秒播放器可能还没自己开始播，短暂补一下 play()
+    driver.execute_script(
+        'window.__ytResumeTimer = setInterval(function () {'
+        '  var v = document.querySelector("video");'
+        '  if (v && v.paused) { try { v.play(); } catch (e) {} }'
+        '}, 200);'
+        'setTimeout(function () { clearInterval(window.__ytResumeTimer); }, 5000);'
+    )
+    # 结束探测器：currentTime 一旦回退就认为播完了（播放器循环时会命中）。
+    # 只能认"回退" —— 往前拖 currentTime 会被站点顶回服务端记录的位置（防跳过）。
+    driver.execute_script(
+        'window.__ytLastPos = 0;'
+        'window.__ytFinishTimer = setInterval(function () {'
+        '  var v = document.querySelector("video");'
+        '  if (!v) { return; }'
+        '  if (v.currentTime < window.__ytLastPos) {'
+        '    var m = document.createElement("span");'
+        '    m.setAttribute("id", "LetMeFly_Finished");'
+        '    document.body.appendChild(m);'
+        '  }'
+        '  window.__ytLastPos = v.currentTime;'
+        '}, 200);'
+    )
     # 播放器带防刷逻辑（页面失焦/不可见就 pause），这里挂到 document 捕获阶段而不是
-    # 全局 video 变量上：pause 不冒泡，但捕获阶段能收到；换掉 <video> 也不会失效。
+    # 某个 video 元素上：pause 不冒泡，但捕获阶段能收到；换掉 <video> 也不会失效。
     # __ytDone 一旦置位就放手 —— 否则离开页面时这个"续播"监听会和卸载流程互相顶。
     driver.execute_script(
         'document.addEventListener("pause", function (e) {'
@@ -829,7 +859,7 @@ def finish1video():
         '  catch (err) {}'
         '}, true)'
     )
-    mute1video()
+    # 锁倍速的同时也把静音锁住（1 秒定时器会持续压 muted=true）
     change2speed2()
 
     last_pos = -1.0
@@ -848,7 +878,9 @@ def finish1video():
         # 挂后台就会无限等下去，所以这里补上 ended / 接近结尾的显式判断。
         try:
             info = driver.execute_script(
-                GET_VIDEO_JS + 'return [v.currentTime || 0, v.duration || 0, v.ended ? 1 : 0];'
+                'var v = document.querySelector("video");'
+                'if (!v) { return null; }'
+                'return [v.currentTime || 0, v.duration || 0, v.ended ? 1 : 0];'
             )
         except Exception:
             info = None
@@ -881,7 +913,6 @@ def finish1video():
             leave_video_window()
             return True
         sleep(3)
-    return False
 
 
 consecutive_errors = 0
@@ -976,9 +1007,18 @@ elif ABORTED_NO_PROGRESS:
     print(f'{ts()} 已中止: 连续 3 轮没能开始播放任何视频（本次共播出 {total_played} 个）。')
     print('  这不代表刷完了。常见原因是课程页没渲染完或窗口状态异常，重跑一般能接着刷。')
 else:
-    print(f'{ts()} 恭喜你！全部播放完毕（本次共播出 {total_played} 个视频）')
+    if LOCKED_VIDEOS:
+        # "未开放"（带锁）的视频不是"已刷完"。别把它们算进成功里。
+        print(f'{ts()} 本次结束: 没有可播的视频了，但还有 {LOCKED_VIDEOS} 个视频处于未开放（带锁）状态，'
+              f'不算全部刷完（本次共播出 {total_played} 个）')
+    else:
+        print(f'{ts()} 恭喜你！全部播放完毕（本次共播出 {total_played} 个视频）')
     if SKIPPED_STALLED:
         print(f'注意: 有 {len(SKIPPED_STALLED)} 个视频因播放卡住被跳过，重跑会再试:')
         for t in SKIPPED_STALLED:
             print(f'  - {t}')
-sleep(5)
+
+sleep(2)
+# 收尾也停一下：双击 exe 时窗口不该在用户看清结果之前就自己关掉。
+# 挂后台 / 输出被重定向时 pause_exit 会自动跳过这一步，不会卡住。
+pause_exit(0)
