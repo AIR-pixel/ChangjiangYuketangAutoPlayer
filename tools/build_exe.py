@@ -3,7 +3,8 @@
 
 产物（都在 dist/ 下）：
     长江雨课堂自动播放器.exe                单文件，双击即用，目标机器不需要装 Python
-    长江雨课堂自动播放器-v<版本>.zip         给用户下载的包：exe + 使用说明.txt + LICENSE
+    长江雨课堂自动播放器-v<版本>.zip         给用户下载的包：
+                                            exe + 使用说明.txt + 作者主页.url + LICENSE
 
 用户那边的初始流程是自动的：exe 启动时发现自己旁边没有 config.ini（或里面还缺
 course_url / cookie），就先走一遍配置向导 —— 自动取登录凭据、列课程让人挑，
@@ -58,6 +59,13 @@ EXCLUDES = [
 USAGE_TXT = """长江雨课堂 - 视频自动播放器（Windows 免安装版）
 ================================================
 
+包里有什么
+----------
+· {app}.exe        —— 主程序，双击就能跑
+· 作者主页.url      —— 双击用默认浏览器打开作者的 GitHub 主页
+· 使用说明.txt      —— 就是这个文件
+· LICENSE           —— 开源许可（LGPL-2.1）
+
 怎么用
 ------
 1. 双击「{app}.exe」。
@@ -83,12 +91,23 @@ exe 旁边会自动生成 config.ini。想换课程：把里面 course_url 那�
 ----
 · 目标机器需要装有 Edge 或 Chrome（Windows 10/11 一般都自带 Edge）。
 · 首次运行会联网下载浏览器驱动，稍有等待属正常；之后走本地缓存。
+· exe 没有代码签名，SmartScreen 可能提示「未知发布者」，点「更多信息」→「仍要运行」。
 · 这类脚本的使用请自行确认符合所在学校/平台的规则，风险自负。
 
 许可
 ----
 LGPL-2.1，详见随包的 LICENSE。
 """
+
+# 随包附一个"直达作者主页"的快捷方式。
+#
+# 用 .url（Internet 快捷方式）而不是 .lnk：
+#   * .lnk 是二进制格式，得靠 COM（WScript.Shell）生成，而本机沙箱正好禁 New-Object -ComObject；
+#   * .url 是 INI 式纯文本，可复现、可 diff，任何 Windows 双击都能用默认浏览器打开。
+# 内容必须是**纯 ASCII 且不带 BOM**：.url 按 ANSI 解析，BOM 会让它整个认不出来。
+# 行尾用 CRLF —— .url 是 INI 血统，按惯例来，别在这里省字节。
+AUTHOR_HOMEPAGE = 'https://github.com/AIR-pixel'
+SHORTCUT_NAME = '作者主页.url'
 
 
 def version() -> str:
@@ -184,10 +203,25 @@ def guard_release(ver: str, force: bool):
                  '    否则对外公布的校验值会与实际附件对不上。')
 
 
+def make_shortcut() -> str:
+    """生成「作者主页.url」并返回路径。
+
+    按字节写而不是用文本模式：要的是**确定的** ASCII + CRLF + 无 BOM，
+    文本模式会跟着平台/编码设置飘，而 .url 一旦带上 BOM 就整个失效。
+    """
+    path = os.path.join(BUILD, SHORTCUT_NAME)
+    with open(path, 'wb') as f:
+        f.write(b'[InternetShortcut]\r\n')
+        f.write(b'URL=' + AUTHOR_HOMEPAGE.encode('ascii') + b'\r\n')
+    return path
+
+
 def make_zip(ver: str) -> str:
     target = zip_target(ver)
     exe = os.path.join(DIST, APP_NAME + '.exe')
-    members = [(exe, f'{APP_NAME}.exe'), (os.path.join(REPO, 'LICENSE'), 'LICENSE')]
+    members = [(exe, f'{APP_NAME}.exe'),
+               (os.path.join(REPO, 'LICENSE'), 'LICENSE'),
+               (make_shortcut(), SHORTCUT_NAME)]
     usage = os.path.join(BUILD, '使用说明.txt')
     # utf-8-sig：老版本记事本不认无 BOM 的 UTF-8，会显示成乱码
     with open(usage, 'w', encoding='utf-8-sig') as f:
